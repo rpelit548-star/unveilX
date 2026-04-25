@@ -11,12 +11,24 @@ const {
   ButtonStyle
 } = require('discord.js');
 const { request } = require('undici');
-// Asegúrate de que estos archivos existan en la misma carpeta:
+const http = require('http'); 
 const { deobfuscate } = require('./deobfuscator'); 
 const { uploadToPastefy } = require('./pastefy');
 
 const PREFIX = '.l';
 const TOKEN = process.env.DISCORD_TOKEN;
+
+// Se establece el puerto 3000 explícitamente para Railway
+const PORT = process.env.PORT || 3000; 
+
+// --- SERVIDOR WEB DE SALUD PARA RAILWAY ---
+// Este servidor responde a Railway para confirmar que la app está viva
+http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('UnveilX Bot is Online\n');
+}).listen(PORT, () => {
+  console.log(`[WEB] Servidor escuchando en puerto ${PORT}`);
+});
 
 if (!TOKEN) {
   console.error('[FATAL] DISCORD_TOKEN env var is required.');
@@ -37,7 +49,7 @@ const GREEN = 0x2ecc71;
 const GRAY = 0x95a5a6;
 const RED = 0xe74c3c;
 
-const STATUS_LABEL = { good: 'Good', medium: 'Medium', bad: 'Bad' };
+const STATUS_LABEL = { good: 'Bueno', medium: 'Medio', bad: 'Malo' };
 
 function formatTime(ms) {
   if (ms < 1000) return `${ms} ms`;
@@ -59,11 +71,13 @@ async function fetchUrlContent(url) {
 }
 
 async function getInputFromMessage(message, args) {
+  // Manejo de archivos adjuntos
   if (message.attachments && message.attachments.size > 0) {
     const att = message.attachments.first();
     const res = await request(att.url);
     return await res.body.text();
   }
+  // Manejo de URLs o código directo
   if (args.length > 0) {
     const candidate = args.join(' ').trim();
     if (/^https?:\/\//i.test(candidate)) {
@@ -71,4 +85,3 @@ async function getInputFromMessage(message, args) {
     }
     let cleaned = candidate;
     cleaned = cleaned.replace(/^
-http://googleusercontent.com/immersive_entry_chip/0
