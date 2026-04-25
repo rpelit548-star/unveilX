@@ -1,1039 +1,751 @@
-'use strict';
+/**
+ * deobfuscator.js
+ * Dynamic Lua deobfuscation engine — Node.js port of the Python original.
+ * Handles Luau compound-assignment normalisation, MockEnv injection,
+ * subprocess execution and structured report generation.
+ */
 
-const fs   = require('fs');
-const path = require('path');
+"use strict";
 
-const VERSION = '2.0.0';
+const fs        = require("fs");
+const path      = require("path");
+const os        = require("os");
+const { spawn } = require("child_process");
 
-const IL_POOL_ENTRIES = [
-  'IIIIIIII1','vvvvvv1','vvvvvvvv2','vvvvvv3','IIlIlIlI1','lvlvlvlv2',
-  'I1','l1','v1','v2','v3','II','ll','vv','I2'
+// ─── Configuration ────────────────────────────────────────────────────────────
+
+const COMPOUND_ASSIGNMENT_OPERATORS = ["+=", "-=", "*=", "/=", "%=", "..="];
+
+const RELEVANT_PREFIXES = [
+  "ACCESSED",
+  "CALL_RESULT",
+  "local Constants =",
+  "URL DETECTED",
+  "SET GLOBAL",
+  "UNPACK CALLED",
+  "CAPTURED CHUNK",
+  "CLOSURE",
+  "TRACE_PRINT",
+  "PROP_SET",
+  "LOADSTRING",
 ];
 
-const HANDLER_POOL_PREFIXES = [
-  'KQ','HF','W8','SX','Rj','nT','pL','qZ','mV','xB','yC','wD'
-];
+const EXECUTION_TIMEOUT_MS = 20_000;
 
-const MAX_UNWRAP_DEPTH = 60;
+// Path to the Lua 5.1 binary (override via env var LUA_BIN)
+const LUA_BIN = process.env.LUA_BIN || path.join("lua_bin", "lua5.1.exe");
 
-const MAX_MATH_PASSES = 100;
+// ─── Luau Syntax Normalisation ────────────────────────────────────────────────
 
-const ROBLOX_SERVICES = [
-  'ScreenGui','Frame','TextLabel','TextButton','Humanoid',
-  'Player','Players','RunService','TweenService','workspace',
-  'game','script','Instance'
-];
+/**
+ * Walk backwards from `operatorIndex` to find the start of the LHS expression.
+ * Handles chained table accesses (a.b[c].d) and simple identifiers.
+ *
+ * @param {string} content
+ * @param {number} operatorIndex  – index of the first char of the operator
+ * @returns {number}              – index of the first char of the LHS
+ */
+function findCompoundLhsStart(content, operatorIndex) {
+  let idx = operatorIndex - 1;
 
-function isArithmeticSafe(s) {
-  return /^[\d\s\+\-\*\/\%\(\)\.eE]+$/.test(s.trim());
+  // Skip trailing whitespace before the operator
+  while (idx >= 0 && /\s/.test(content[idx])) idx--;
+
+  // Consume bracket subscripts: [...]
+  while (idx >= 0 && content[idx] === "]") {
+    let depth = 1;
+    idx--;
+    while (idx >= 0 && depth > 0) {
+      if (content[idx] === "]") depth++;
+      else if (content[idx] === "[") depth--;
+      idx--;
+    }
+  }
+
+  // Consume identifier characters
+  while (idx >= 0 && /[\w]/.test(content[idx])) idx--;
+
+  // Consume chained member accesses: .ident, .[subscript]
+  while (idx >= 0 && content[idx] === ".") {
+    idx--;
+    while (idx >= 0 && content[idx] === "]") {
+      let depth = 1;
+      idx--;
+      while (idx >= 0 && depth > 0) {
+        if (content[idx] === "]") depth++;
+        else if (content[idx] === "[") depth--;
+        idx--;
+      }
+    }
+    while (idx >= 0 && /[\w]/.test(content[idx])) idx--;
+  }
+
+  return idx + 1;
 }
 
-function safeEvalMath(expr) {
-  if (!expr && expr !== 0) return null;
-  const s = String(expr).trim();
-  if (!s) return null;
+/**
+ * Walk forward from `rhsStart` to find the end of the RHS expression.
+ * Stops at top-level `;`, `,`, newline, or unmatched `)` / `}`.
+ *
+ * @param {string} content
+ * @param {number} rhsStart
+ * @returns {number}  – exclusive end index of the RHS
+ */
+function findCompoundRhsEnd(content, rhsStart) {
+  let idx           = rhsStart;
+  const len         = content.length;
+  let bracketDepth  = 0;
+  let parenDepth    = 0;
+  let braceDepth    = 0;
+  let quote         = null;
 
-  if (/^\d+$/.test(s)) return parseInt(s, 10);
+  // Skip leading whitespace
+  while (idx < len && /\s/.test(content[idx])) idx++;
 
-  if (!isArithmeticSafe(s)) return null;
+  while (idx < len) {
+    const ch = content[idx];
+
+    if (quote) {
+      if (ch === "\\") { idx += 2; continue; }
+      if (ch === quote) quote = null;
+      idx++;
+      continue;
+    }
+
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      idx++;
+      continue;
+    }
+
+    if      (ch === "[") bracketDepth++;
+    else if (ch === "]") bracketDepth = Math.max(0, bracketDepth - 1);
+    else if (ch === "(") parenDepth++;
+    else if (ch === ")") {
+      if (parenDepth === 0 && bracketDepth === 0 && braceDepth === 0) break;
+      parenDepth = Math.max(0, parenDepth - 1);
+    }
+    else if (ch === "{") braceDepth++;
+    else if (ch === "}") {
+      if (braceDepth === 0 && bracketDepth === 0 && parenDepth === 0) break;
+      braceDepth = Math.max(0, braceDepth - 1);
+    }
+    else if (bracketDepth === 0 && parenDepth === 0 && braceDepth === 0) {
+      if (";,\n\r".includes(ch)) break;
+      if (/\s/.test(ch))         break;
+    }
+
+    idx++;
+  }
+
+  return idx;
+}
+
+/**
+ * Rewrite Luau compound assignments to plain Lua 5.1 syntax.
+ * e.g.  `x += 1`  →  `x = x + 1`
+ *
+ * @param {string} content
+ * @returns {string}
+ */
+function normalizeLuauSyntax(content) {
+  const replacements = [];
+  let idx = 0;
+
+  while (idx < content.length) {
+    let matchedOp = null;
+    for (const op of COMPOUND_ASSIGNMENT_OPERATORS) {
+      if (content.startsWith(op, idx)) { matchedOp = op; break; }
+    }
+
+    if (!matchedOp) { idx++; continue; }
+
+    const lhsStart = findCompoundLhsStart(content, idx);
+    const rhsStart = idx + matchedOp.length;
+    const rhsEnd   = findCompoundRhsEnd(content, rhsStart);
+
+    const lhs = content.slice(lhsStart, idx).trim();
+    const rhs = content.slice(rhsStart, rhsEnd).trim();
+
+    if (lhs && rhs) {
+      const arithmeticOp = matchedOp.slice(0, -1); // strip trailing '='
+      replacements.push({ start: lhsStart, end: rhsEnd, replacement: `${lhs} = ${lhs} ${arithmeticOp} ${rhs}` });
+    }
+    idx = rhsEnd;
+  }
+
+  if (replacements.length === 0) return content;
+
+  // Apply in reverse so indices remain valid
+  let rewritten = content;
+  for (const { start, end, replacement } of replacements.reverse()) {
+    rewritten = rewritten.slice(0, start) + replacement + rewritten.slice(end);
+  }
+  return rewritten;
+}
+
+// ─── MockEnv Lua Block ────────────────────────────────────────────────────────
+
+/**
+ * Returns the Lua source block that provides the mock execution environment.
+ * Identical in behaviour to the Python original.
+ *
+ * @returns {string}
+ */
+function getMockEnvCode() {
+  return /* lua */ `
+local real_type = type
+local real_tonumber = tonumber
+local real_unpack = unpack
+local real_concat = table.concat
+local real_tostring = tostring
+local real_print = print
+
+local _WAIT_COUNT = 0
+local _LOOP_COUNTER = 0
+local _MAX_LOOPS = 150
+local _LOOP_BODIES = {}
+
+local function _check_loop()
+    _LOOP_COUNTER = _LOOP_COUNTER + 1
+    if _LOOP_COUNTER > _MAX_LOOPS then return false end
+    return true
+end
+
+local function type(v)
+    local mt = getmetatable(v)
+    if mt and mt.__is_mock_dummy then return "userdata" end
+    return real_type(v)
+end
+
+local function typeof(v)
+    local mt = getmetatable(v)
+    if mt and mt.__is_mock_dummy then return "Instance" end
+    return type(v)
+end
+
+local function tonumber(v, base)
+    if type(v) == "userdata" or (type(v) == "table" and getmetatable(v) and getmetatable(v).__is_mock_dummy) then
+        return 1
+    end
+    return real_tonumber(v, base)
+end
+
+local function unpack(t, i, j)
+    if real_type(t) == "table" then
+        local looks_like_chunk = true
+        for k, v in pairs(t) do
+            if real_type(k) ~= "number" then looks_like_chunk = false break end
+        end
+        if looks_like_chunk and #t > 0 then
+            print("UNPACK CALLED WITH TABLE (Potential Chunk): size=" .. #t)
+            local success, res = pcall(real_concat, t, ",")
+            if success then
+                print("CAPTURED CHUNK STRING: " .. res)
+                if res:match("http") or res:match("www") then
+                    print("URL DETECTED IN UNPACK --> " .. res:match("https?://[%w%.%-%/]+"))
+                end
+            end
+        end
+    end
+    return real_unpack(t, i, j)
+end
+
+local function table_concat(t, sep, i, j)
+    local res = real_concat(t, sep, i, j)
+    if real_type(res) == "string" and (res:match("http") or res:match("www")) then
+        print("URL DETECTED IN CONCAT --> " .. res:match("https?://[%w%.%-%/]+"))
+    end
+    return res
+end
+
+local function escape_lua_string(s)
+    local parts = {'"'}
+    for i = 1, #s do
+        local byte = string.byte(s, i)
+        if byte == 92 then table.insert(parts, "\\\\")
+        elseif byte == 34 then table.insert(parts, '\\"')
+        elseif byte == 10 then table.insert(parts, "\\n")
+        elseif byte == 13 then table.insert(parts, "\\r")
+        elseif byte == 9  then table.insert(parts, "\\t")
+        elseif byte >= 32 and byte <= 126 then table.insert(parts, string.char(byte))
+        else table.insert(parts, string.format("\\%03d", byte)) end
+    end
+    table.insert(parts, '"')
+    return table.concat(parts)
+end
+
+local function recursive_tostring(v, depth)
+    if depth == nil then depth = 0 end
+    if depth > 2 then return tostring(v) end
+    if real_type(v) == "string" then return escape_lua_string(v)
+    elseif real_type(v) == "number" then
+        if v == math.floor(v) and v >= -2147483648 and v <= 2147483647 then return tostring(math.floor(v)) end
+        return tostring(v)
+    elseif real_type(v) == "boolean" then return tostring(v)
+    elseif v == nil then return "nil"
+    elseif real_type(v) == "table" then
+        if getmetatable(v) and getmetatable(v).__is_mock_dummy then return tostring(v) end
+        local parts = {}
+        local keys = {}
+        for k in pairs(v) do table.insert(keys, k) end
+        table.sort(keys, function(a,b) return tostring(a) < tostring(b) end)
+        for _, k in ipairs(keys) do
+            local val = v[k]
+            local k_str = tostring(k)
+            if real_type(k) == "string" then k_str = '["' .. k .. '"]' end
+            table.insert(parts, k_str .. " = " .. recursive_tostring(val, depth + 1))
+        end
+        return "{" .. real_concat(parts, ", ") .. "}"
+    elseif real_type(v) == "function" then return tostring(v)
+    else return tostring(v) end
+end
+
+local function create_dummy(name)
+    local d = {}
+    local mt = {
+        __is_mock_dummy = true,
+        __index = function(_, k)
+            print("ACCESSED --> " .. name .. "." .. k)
+            if k == "HttpGet" or k == "HttpGetAsync" then
+                return function(_, url, ...)
+                    print("URL DETECTED --> " .. tostring(url))
+                    return create_dummy("HttpGetResult")
+                end
+            end
+            return create_dummy(name .. "." .. k)
+        end,
+        __newindex = function(_, k, v)
+            local val_str = recursive_tostring(v, 0)
+            print("PROP_SET --> " .. name .. "." .. k .. " = " .. val_str)
+        end,
+        __call = function(_, ...)
+            local args = {...}
+            local arg_str = ""
+            for i, v in ipairs(args) do
+                if i > 1 then arg_str = arg_str .. ", " end
+                arg_str = arg_str .. recursive_tostring(v)
+            end
+            local var_name = name:gsub("%.", "_") .. "_" .. math.random(100, 999)
+            print("CALL_RESULT --> local " .. var_name .. " = " .. name .. "(" .. arg_str .. ")")
+            if name == "task.wait" or name == "wait" then
+                _WAIT_COUNT = _WAIT_COUNT + 1
+                if _WAIT_COUNT > 10 then error("Too many waits!") end
+            end
+            for i, v in ipairs(args) do
+                if real_type(v) == "function" then
+                    print("--- ENTERING CLOSURE FOR " .. name .. " ---")
+                    local success, err = pcall(v,
+                        create_dummy("arg1"), create_dummy("arg2"),
+                        create_dummy("arg3"), create_dummy("arg4"))
+                    if not success then print("-- CLOSURE ERROR: " .. tostring(err)) end
+                    print("--- EXITING CLOSURE FOR " .. name .. " ---")
+                end
+            end
+            return create_dummy(var_name)
+        end,
+        __tostring  = function() return name end,
+        __concat    = function(a, b) return tostring(a) .. tostring(b) end,
+        __add       = function(a, b) return create_dummy("("..tostring(a).."+"..tostring(b)..")") end,
+        __sub       = function(a, b) return create_dummy("("..tostring(a).."-"..tostring(b)..")") end,
+        __mul       = function(a, b) return create_dummy("("..tostring(a).."*"..tostring(b)..")") end,
+        __div       = function(a, b) return create_dummy("("..tostring(a).."/"..tostring(b)..")") end,
+        __mod       = function(a, b) return create_dummy("("..tostring(a).."%"..tostring(b)..")") end,
+        __pow       = function(a, b) return create_dummy("("..tostring(a).."^"..tostring(b)..")") end,
+        __unm       = function(a)    return create_dummy("-"..tostring(a)) end,
+        __lt        = function(a, b) return false end,
+        __le        = function(a, b) return false end,
+        __eq        = function(a, b) return false end,
+        __len       = function(a)    return 2 end,
+    }
+    setmetatable(d, mt)
+    return d
+end
+
+local function mock_pairs(t)
+    local mt = getmetatable(t)
+    if mt and mt.__is_mock_dummy then
+        local i = 0
+        return function(...)
+            i = i + 1
+            if i <= 1 then return i, create_dummy(tostring(t).."_v"..i) end
+            return nil
+        end
+    end
+    return pairs(t)
+end
+
+local function mock_ipairs(t)
+    local mt = getmetatable(t)
+    if mt and mt.__is_mock_dummy then
+        local i = 0
+        return function(...)
+            i = i + 1
+            if i <= 1 then return i, create_dummy(tostring(t).."_v"..i) end
+            return nil
+        end
+    end
+    return ipairs(t)
+end
+
+local MockEnv = {}
+local safe_globals = {
+    ["string"]   = string,
+    ["table"]    = { insert = table.insert, remove = table.remove, sort = table.sort, concat = table_concat, maxn = table.maxn },
+    ["math"]     = math,
+    ["pairs"]    = mock_pairs,
+    ["ipairs"]   = mock_ipairs,
+    ["select"]   = select,
+    ["unpack"]   = unpack,
+    ["tonumber"] = tonumber,
+    ["tostring"] = tostring,
+    ["type"]     = type,
+    ["typeof"]   = typeof,
+    ["pcall"]    = pcall,
+    ["xpcall"]   = xpcall,
+    ["getfenv"]  = getfenv,
+    ["setmetatable"] = setmetatable,
+    ["getmetatable"] = getmetatable,
+    ["error"]    = error,
+    ["assert"]   = assert,
+    ["next"]     = next,
+    ["print"]    = function(...)
+        local args = {...}
+        local parts = {}
+        for i,v in ipairs(args) do table.insert(parts, tostring(v)) end
+        print("TRACE_PRINT --> " .. table.concat(parts, "\\t"))
+    end,
+    ["_VERSION"] = _VERSION,
+    ["rawset"]   = rawset,
+    ["rawget"]   = rawget,
+    ["os"]       = os, ["io"] = io, ["package"] = package, ["debug"] = debug,
+    ["dofile"]   = dofile, ["loadfile"] = loadfile,
+    ["loadstring"] = function(s)
+        print("LOADSTRING DETECTED: size=" .. tostring(#s))
+        print("LOADSTRING CONTENT START")
+        print(s)
+        print("LOADSTRING CONTENT END")
+        return function() print("DUMMY FUNC CALLED") end
+    end,
+}
+
+local _exploit_funcs = {
+    "getgc","getinstances","getnilinstances","getloadedmodules","getconnections",
+    "firesignal","fireclickdetector","firetouchinterest","isnetworkowner",
+    "gethiddenproperty","sethiddenproperty","setsimulationradius",
+    "rconsoleprint","rconsolewarn","rconsoleerr","rconsoleinfo","rconsolename","rconsoleclear",
+    "consoleprint","consolewarn","consoleerr","consoleinfo","consolename","consoleclear",
+    "warn","print","error","debug","clonefunction","hookfunction","newcclosure",
+    "replaceclosure","restoreclosure","islclosure","iscclosure","checkcaller",
+    "getnamecallmethod","setnamecallmethod","getrawmetatable","setrawmetatable",
+    "setreadonly","isreadonly","iswindowactive","keypress","keyrelease",
+    "mouse1click","mouse1press","mouse1release","mousescroll","mousemoverel","mousemoveabs",
+    "hookmetamethod","getcallingscript","makefolder","writefile","readfile","appendfile",
+    "loadfile","listfiles","isfile","isfolder","delfile","delfolder","dofile",
+    "bit","bit32","Vector2","Vector3","CFrame","UDim2","Color3","Instance","Ray",
+    "Enum","BrickColor","NumberRange","NumberSequence","ColorSequence",
+    "task","coroutine","Delay","delay","Spawn","spawn","Wait","wait",
+    "workspace","Workspace","tick","time","elapsedTime","utf8",
+}
+local _exploit_set = {}
+for _, v in ipairs(_exploit_funcs) do _exploit_set[v] = true end
+
+setmetatable(MockEnv, {
+    __index = function(t, k)
+        if safe_globals[k] then return safe_globals[k] end
+        if k == "game" then print("ACCESSED --> game"); return create_dummy("game") end
+        if k == "getgenv" or k == "getrenv" or k == "getreg" then return function() return MockEnv end end
+        if _exploit_set[k] then print("ACCESSED --> " .. k); return create_dummy(k) end
+        print("ACCESSED (NIL) --> " .. k)
+        return nil
+    end,
+    __newindex = function(t, k, v)
+        local val_str
+        if real_type(v) == "string" then val_str = '"' .. v .. '"'
+        elseif real_type(v) == "number" or real_type(v) == "boolean" then val_str = tostring(v)
+        else val_str = tostring(v) end
+        print("SET GLOBAL --> " .. tostring(k) .. " = " .. val_str)
+        rawset(t, k, v)
+    end,
+})
+
+safe_globals["_G"]     = MockEnv
+safe_globals["shared"] = MockEnv
+`;
+}
+
+// ─── Core Deobfuscation Logic ─────────────────────────────────────────────────
+
+/**
+ * Identify the string-table variable name from the obfuscated source.
+ *
+ * @param {string} content
+ * @returns {string|null}
+ */
+function detectVarName(content) {
+  const m = content.match(/local ([a-zA-Z0-9_]+)=\{"/) ;
+  return m ? m[1] : null;
+}
+
+/**
+ * Build the Lua snippet that dumps the constants table to stdout.
+ *
+ * @param {string} varName
+ * @returns {string}
+ */
+function buildDumperCode(varName) {
+  return /* lua */ `
+    print("--- CONSTANTS START ---")
+    if ${varName} then
+        local sorted_keys = {}
+        for k in pairs(${varName}) do table.insert(sorted_keys, k) end
+        table.sort(sorted_keys)
+        local out = "local Constants = {"
+        for i, k in ipairs(sorted_keys) do
+            local v = ${varName}[k]
+            local v_str = escape_lua_string(v)
+            out = out .. " [" .. k .. "] = " .. v_str .. ","
+        end
+        out = out .. " }"
+        print(out)
+    end
+    print("--- CONSTANTS END ---")
+`;
+}
+
+/**
+ * Determine the injection point: just before `return(function`.
+ *
+ * @param {string} content
+ * @param {number} beforeIdx  – search limit (rfind behaviour)
+ * @returns {number}
+ */
+function findReturnFunctionIdx(content, beforeIdx) {
+  return content.lastIndexOf("return(function", beforeIdx);
+}
+
+/**
+ * Replace getfenv patterns with MockEnv.
+ *
+ * @param {string} content
+ * @returns {string}
+ */
+function replaceGetfenv(content) {
+  // Specific combined form first
+  content = content.replace(/getfenv\s+and\s+getfenv\(\)or\s+_ENV/g, "MockEnv");
+  // Generic getfenv() standalone
+  content = content.replace(/getfenv\s*\(\s*\)\s*or\s*_ENV/g, "MockEnv");
+  return content;
+}
+
+/**
+ * Spawn lua5.1 and collect stdout line-by-line with a hard timeout.
+ *
+ * @param {string} tempFilePath
+ * @returns {Promise<string[]>}  – all stdout lines
+ */
+function runLua(tempFilePath) {
+  return new Promise((resolve) => {
+    const lines  = [];
+    let   buffer = "";
+    let   done   = false;
+
+    const proc = spawn(LUA_BIN, [tempFilePath, "1"], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    const finish = () => {
+      if (done) return;
+      done = true;
+      if (buffer.trim()) lines.push(buffer.trim());
+      resolve(lines);
+    };
+
+    const timer = setTimeout(() => {
+      console.log("  [TIMEOUT] Killing Lua process after 20 s.");
+      proc.kill();
+      finish();
+    }, EXECUTION_TIMEOUT_MS);
+
+    proc.stdout.on("data", (chunk) => {
+      buffer += chunk.toString("utf8");
+      const parts = buffer.split(/\r?\n/);
+      buffer = parts.pop(); // last fragment (may be incomplete)
+      for (const line of parts) {
+        lines.push(line);
+        if (RELEVANT_PREFIXES.some((p) => line.includes(p))) {
+          console.log("  " + line);
+        }
+      }
+    });
+
+    proc.stderr.on("data", (chunk) => {
+      const text = chunk.toString("utf8").trim();
+      if (text) console.error("  [STDERR]", text);
+    });
+
+    proc.on("close", () => {
+      clearTimeout(timer);
+      finish();
+    });
+
+    proc.on("error", (err) => {
+      console.error(`  [SPAWN ERROR] ${err.message}`);
+      clearTimeout(timer);
+      finish();
+    });
+  });
+}
+
+/**
+ * Main deobfuscation routine for a single file.
+ *
+ * @param {string} filePath
+ */
+async function deobfuscateFile(filePath) {
+  console.log(`\nProcessing: ${filePath}`);
+
+  // Skip already-processed files
+  if (filePath.includes(".deobf.") || filePath.includes(".report.")) {
+    console.log("  Skipping processed file.");
+    return;
+  }
+
+  // ── 1. Read source ────────────────────────────────────────────────────────
+  let content;
+  try {
+    content = fs.readFileSync(filePath, { encoding: "utf8", flag: "r" });
+  } catch (err) {
+    console.error(`  [ERROR] Cannot read file: ${err.message}`);
+    return;
+  }
+
+  // ── 2. Normalise Luau compound operators ──────────────────────────────────
+  content = normalizeLuauSyntax(content);
+
+  // ── 3. Detect string-table variable ──────────────────────────────────────
+  const varName = detectVarName(content);
+  if (!varName) {
+    console.warn("  [WARN] Could not identify string-table variable. Proceeding without constant dumper.");
+  }
+
+  // ── 4. Find injection points ──────────────────────────────────────────────
+  let idxArgs = content.lastIndexOf("(getfenv");
+  if (idxArgs === -1) idxArgs = content.lastIndexOf("( getfenv");
+  if (idxArgs === -1) idxArgs = content.length;
+
+  const idxRet = findReturnFunctionIdx(content, idxArgs);
+  if (idxRet === -1) {
+    console.error("  [ERROR] Could not find return(function injection point.");
+    return;
+  }
+
+  // ── 5. Build patched Lua source ───────────────────────────────────────────
+  const mockEnv    = getMockEnvCode();
+  const dumperCode = varName ? buildDumperCode(varName) : "";
+
+  let patched = mockEnv + content.slice(0, idxRet) + dumperCode + content.slice(idxRet);
+  patched     = replaceGetfenv(patched);
+
+  // ── 6. Write temp file ────────────────────────────────────────────────────
+  const tmpFile = path.join(os.tmpdir(), `deob_${Date.now()}_${Math.random().toString(36).slice(2)}.lua`);
+  try {
+    fs.writeFileSync(tmpFile, patched, "utf8");
+  } catch (err) {
+    console.error(`  [ERROR] Cannot write temp file: ${err.message}`);
+    return;
+  }
+
+  // ── 7. Execute ────────────────────────────────────────────────────────────
+  console.log("  Executing via Lua 5.1…");
+  const stdoutLines = await runLua(tmpFile);
+
+  // ── 8. Parse output ───────────────────────────────────────────────────────
+  let   inConstants   = false;
+  let   constantsStr  = "";
+  const traceLines    = [];
+
+  for (const line of stdoutLines) {
+    if (line === "--- CONSTANTS START ---") { inConstants = true;  continue; }
+    if (line === "--- CONSTANTS END ---")   { inConstants = false; continue; }
+
+    if (inConstants) {
+      constantsStr += line + "\n";
+    } else if (RELEVANT_PREFIXES.some((p) => line.includes(p))) {
+      traceLines.push(line);
+    }
+  }
+
+  // ── 9. Write report ───────────────────────────────────────────────────────
+  const reportFile = filePath + ".report.txt";
+  const reportContent = [
+    "--- DEOBFUSCATION REPORT ---",
+    `File: ${filePath}`,
+    "",
+    "--- TRACE ---",
+    ...traceLines,
+    "",
+    "--- CONSTANTS ---",
+    constantsStr,
+  ].join("\n");
 
   try {
-
-    const result = new Function('"use strict"; return (' + s + ');')();
-    if (typeof result === 'number' && isFinite(result)) {
-      return Math.round(result);
-    }
-    return null;
-  } catch {
-    return null;
+    fs.writeFileSync(reportFile, reportContent, "utf8");
+    console.log(`  Report saved → ${reportFile}`);
+  } catch (err) {
+    console.error(`  [ERROR] Cannot write report: ${err.message}`);
   }
+
+  // ── 10. Cleanup temp file ─────────────────────────────────────────────────
+  try { fs.unlinkSync(tmpFile); } catch (_) {}
 }
 
-function simplifyMathExpressions(code) {
-  let result = code;
-  let changed = true;
-  let passes = 0;
-
-  while (changed && passes < MAX_MATH_PASSES) {
-    changed = false;
-    passes++;
-
-    const next = result.replace(/\(([^()]+)\)/g, (match, inner) => {
-      if (!isArithmeticSafe(inner)) return match;
-      const val = safeEvalMath(inner);
-      if (val === null) return match;
-      changed = true;
-      return String(val);
-    });
-    if (next !== result) result = next;
-
-
-    const trivial = result
-      .replace(/\b(\d+)\s*\+\s*0\b/g,  (_, n) => { changed = true; return n; })
-      .replace(/\b0\s*\+\s*(\d+)\b/g,  (_, n) => { changed = true; return n; })
-      .replace(/\b(\d+)\s*\*\s*1\b/g,  (_, n) => { changed = true; return n; })
-      .replace(/\b1\s*\*\s*(\d+)\b/g,  (_, n) => { changed = true; return n; })
-      .replace(/\b(\d+)\s*\/\s*1\b/g,  (_, n) => { changed = true; return n; })
-      .replace(/\b(\d+)\s*-\s*0\b/g,   (_, n) => { changed = true; return n; });
-    if (trivial !== result) result = trivial;
-
-    result = result.replace(/\b(\d+)\s*([\+\-\*\/])\s*(\d+)\b(?!\s*[\*\/])/g, (m, a, op, b) => {
-      const av = parseInt(a, 10), bv = parseInt(b, 10);
-      let v;
-      switch (op) {
-        case '+': v = av + bv; break;
-        case '-': v = av - bv; break;
-        case '*': v = av * bv; break;
-        case '/': if (bv === 0) return m; v = Math.floor(av / bv); break;
-        default: return m;
-      }
-      if (!isFinite(v)) return m;
-      changed = true;
-      return String(v);
-    });
-  }
-
-  return result;
-}
-
-function simplifyMBAPatterns(code) {
-
-  return code.replace(
-    /\(\(\s*(\d+)\s*\*\s*(\d+)\s*-\s*(\d+)\s*\)\s*\/\s*\(\s*(\d+)\s*\+\s*1\s*\)\s*\+\s*(\d+)\s*\)/g,
-    (match, n1, a, a2, b, n2) => {
-      if (n1 !== n2) return match;
-      const n = parseInt(n1, 10), aVal = parseInt(a, 10), a2Val = parseInt(a2, 10);
-      if (aVal !== a2Val) return match;
-      const bVal = parseInt(b, 10);
-      const result = ((n * aVal - aVal) / (bVal + 1)) + n;
-      if (Number.isInteger(result)) return String(result);
-      return match;
-    }
-  );
-}
-
-function splitTopLevelCommas(s) {
-  const parts = [];
-  let depth = 0, buf = '';
-  for (const ch of s) {
-    if      (ch === '(') { depth++; buf += ch; }
-    else if (ch === ')') { depth--; buf += ch; }
-    else if (ch === ',' && depth === 0) { parts.push(buf); buf = ''; }
-    else buf += ch;
-  }
-  if (buf) parts.push(buf);
-  return parts;
-}
-
-function decodeStringChar(code) {
-
-  let result = simplifyMathExpressions(code);
-
-  return result.replace(/string\.char\s*\(([^)]+)\)/g, (match, inner) => {
-
-    const simplified = simplifyMathExpressions(inner);
-    const parts = splitTopLevelCommas(simplified);
-    const chars = [];
-    for (const part of parts) {
-      const n = safeEvalMath(part.trim());
-      if (n === null || n < 0 || n > 255) return match;
-      chars.push(String.fromCharCode(n));
-    }
-    const decoded = chars.join('');
-
-    const escaped = decoded
-      .replace(/\\/g, '\\\\')
-      .replace(/"/g, '\\"')
-      .replace(/\n/g, '\\n')
-      .replace(/\r/g, '\\r');
-    return `"${escaped}"`;
-  });
-}
-
-const RUNTIME_ID_MAP = {
-  'assert':     'assert',
-  'loadstring': 'loadstring',
-  'game':       'game',
-  'HttpGet':    'HttpGet',
-  'print':      'print',
-  'tostring':   'tostring',
-  'tonumber':   'tonumber',
-  'pcall':      'pcall',
-  'error':      'error',
-  'type':       'type',
-  'rawget':     'rawget',
-  'rawset':     'rawset',
-  'setfenv':    'setfenv',
-  'getfenv':    'getfenv',
-  'unpack':     'unpack',
-  'select':     'select',
-  'next':       'next',
-  'pairs':      'pairs',
-  'ipairs':     'ipairs',
-  'require':    'require',
-};
-
-function resolveGetfenvStrings(code) {
-  let result = code;
-
-  result = result.replace(/getfenv\s*\(\s*\)\s*\[\s*"([^"]+)"\s*\]/g, (m, key) => {
-    return RUNTIME_ID_MAP[key] || key;
-  });
-
-  result = result.replace(/getfenv\s*\(\s*\)\s*\[\s*'([^']+)'\s*\]/g, (m, key) => {
-    return RUNTIME_ID_MAP[key] || key;
-  });
-
-  result = result.replace(/_G\s*\[\s*"([^"]+)"\s*\]/g, (m, key) => {
-    return RUNTIME_ID_MAP[key] || m;
-  });
-
-  result = result.replace(
-    /(\w+)\s*\[\s*"HttpGet"\s*\]\s*\(\s*\1\s*,\s*([^)]+)\)/g,
-    (m, gameVar, urlExpr) => `game:HttpGet(${urlExpr})`
-  );
-
-  return result;
-}
-
-function extractNumericArray(str) {
-  if (!str || !str.trim()) return [];
-  const parts = splitTopLevelCommas(str.trim());
-  return parts.map(p => {
-    const s = simplifyMathExpressions(p.trim());
-    const v = safeEvalMath(s);
-    if (v !== null) return v;
-    const n = parseFloat(s);
-    return isNaN(n) ? null : Math.floor(n);
-  });
-}
-
-function decryptVMPayload(code) {
-
-
-
-
-
-  const headerRx = /local\s+(\w+)\s*=\s*\{\}\s+local\s+(\w+)\s*=\s*(\d+)\s+local\s+(\w+)\s*=\s*(\d+)\b/;
-  const hMatch = code.match(headerRx);
-  if (!hMatch) {
-    return { success: false, error: 'Cannot locate STACK/KEY/SALT triple' };
-  }
-
-  const STACK_VAR = hMatch[1];
-  const KEY_VAR   = hMatch[2];
-  const seed      = parseInt(hMatch[3], 10);
-  const SALT_VAR  = hMatch[4];
-  const saltVal   = parseInt(hMatch[5], 10);
-
-  if (isNaN(seed) || isNaN(saltVal)) {
-    return { success: false, error: `Non-numeric seed(${hMatch[3]}) or salt(${hMatch[5]})` };
-  }
-
-
-
-
-
-  const poolDecls = new Map();
-  const pdRx = /local\s+(\w+)\s*=\s*\{([\d,\s]+)\}/g;
-  let pdMatch;
-  while ((pdMatch = pdRx.exec(code)) !== null) {
-    const name = pdMatch[1];
-
-    if (name === STACK_VAR) continue;
-    const nums = pdMatch[2]
-      .split(',')
-      .map(n => parseInt(n.trim(), 10))
-      .filter(n => !isNaN(n));
-    if (nums.length > 0) poolDecls.set(name, nums);
-  }
-
-  if (poolDecls.size === 0) {
-    return { success: false, error: 'No pool variable declarations found' };
-  }
-
-  const poolArrRx = /local\s+_pool\s*=\s*\{(\w+(?:\s*,\s*\w+)*)\}/;
-  const paMatch = code.match(poolArrRx);
-  if (!paMatch) {
-
-
-
-    const allNames = [...poolDecls.keys()];
-    if (allNames.length === 0) return { success: false, error: 'Cannot locate _pool array' };
-
-
-    return decryptWithExplicitPool(code, poolDecls, seed, saltVal, allNames);
-  }
-
-  const poolOrder = paMatch[1].split(',').map(s => s.trim());
-
-  const orderRx = /local\s+_order\s*=\s*\{([\d,\s]+)\}/;
-  const oMatch = code.match(orderRx);
-  if (!oMatch) {
-    return { success: false, error: 'Cannot locate _order array' };
-  }
-
-  const realIndices = oMatch[1]
-    .split(',')
-    .map(n => parseInt(n.trim(), 10))
-    .filter(n => !isNaN(n));
-
-  if (realIndices.length === 0) {
-    return { success: false, error: '_order array is empty or unparseable' };
-  }
-
-  return _runDecryption(poolOrder, poolDecls, realIndices, seed, saltVal);
-}
-
-function decryptWithExplicitPool(code, poolDecls, seed, saltVal, allNames) {
-  const orderRx = /local\s+_order\s*=\s*\{([\d,\s]+)\}/;
-  const oMatch  = code.match(orderRx);
-  if (!oMatch) return { success: false, error: 'No _order found in fallback path' };
-
-  const realIndices = oMatch[1]
-    .split(',').map(n => parseInt(n.trim(), 10)).filter(n => !isNaN(n));
-
-  return _runDecryption(allNames, poolDecls, realIndices, seed, saltVal);
-}
-
-function _runDecryption(poolOrder, poolDecls, realIndices, seed, saltVal) {
-  const outputChars = [];
-  let globalIdx = 0;
-  const errors  = [];
-
-  for (const luaIdx of realIndices) {
-
-    const varName = poolOrder[luaIdx - 1];
-    if (!varName) {
-      errors.push(`_order references pool index ${luaIdx} but pool only has ${poolOrder.length} entries`);
-      continue;
-    }
-    const encBytes = poolDecls.get(varName);
-    if (!encBytes) {
-      errors.push(`Pool variable "${varName}" has no declaration`);
-      continue;
-    }
-
-    for (const encByte of encBytes) {
-
-      let dec = ((encByte - seed - (globalIdx * saltVal)) % 256 + 256) % 256;
-      outputChars.push(String.fromCharCode(dec));
-      globalIdx++;
-    }
-  }
-
-  const payload = outputChars.join('');
-
-  if (payload.length === 0) {
-    return {
-      success: false,
-      error: `Decryption produced empty output. Errors: ${errors.join('; ')}`
-    };
-  }
-
-  return {
-    success: true,
-    payload,
-    metadata: {
-      seed,
-      saltVal,
-      realChunkCount:  realIndices.length,
-      totalPoolSize:   poolOrder.length,
-      payloadLength:   payload.length,
-      warnings:        errors,
-    }
-  };
-}
-
-const ANTI_DEBUG_PATTERNS = [
-
-  /local\s+\w+\s*=\s*os\.clock\s*\(\s*\)\s+(?:local\s+\w+\s*=\s*\w+\s*\(\s*\)\s+)?for\s+_\s*=\s*1\s*,\s*150000\s+do\s+end\s+if\s+os\.clock\s*\(\s*\)\s*-\s*\w+\s*>\s*5\.0\s+then\s+while\s+true\s+do\s+end\s+end\s*/g,
-
-  /local\s+\w+\s*=\s*os\.clock\s+local\s+\w+\s*=\s*\w+\s*\(\s*\)\s+for\s+_\s*=\s*1\s*,\s*150000\s+do\s+end\s+if\s+os\.clock\s*\(\s*\)\s*-\s*\w+\s*>\s*5\.0\s+then\s+while\s+true\s+do\s+end\s+end\s*/g,
-
-  /if\s+debug\s*~=\s*nil\s+and\s+debug\.getinfo\s+then\s+local\s+\w+\s*=\s*debug\.getinfo\s*\(\s*1\s*\)\s+if\s+\w+\.what\s*~=\s*"main"\s+and\s+\w+\.what\s*~=\s*"Lua"\s+then\s+while\s+true\s+do\s+end\s+end\s+end\s*/g,
-
-  /if\s+debug\s+and\s+debug\.sethook\s+then\s+debug\.sethook\s*\([^)]+\)\s+end\s*/g,
-
-  /local\s+\w+\s*,\s*\w+\s*=\s*pcall\s*\(function\s*\(\s*\)\s+error\s*\(\s*"[^"]+"\s*\)\s+end\s*\)\s+if\s+not\s+string\.find\s*\([^)]+\)\s+then\s+while\s+true\s+do\s+end\s+end\s*/g,
-
-  /if\s+getmetatable\s*\(\s*_G\s*\)\s*~=\s*nil\s+then\s+while\s+true\s+do\s+end\s+end\s*/g,
-
-  /if\s+type\s*\(\s*print\s*\)\s*~=\s*"function"\s+then\s+while\s+true\s+do\s+end\s+end\s*/g,
-];
-
-function stripAntiDebug(code) {
-  let result = code;
-  for (const pat of ANTI_DEBUG_PATTERNS) {
-    pat.lastIndex = 0;
-    result = result.replace(pat, ' ');
-  }
-  return collapseSpaces(result);
-}
-
-function stripIIFEGuards(code) {
-  let result = code;
-  let changed = true;
-  let passes  = 0;
-
-  while (changed && passes < 40) {
-    changed = false;
-    passes++;
-
-    const next = result.replace(
-      /local\s+(\w+)\s*=\s*function\s*\(\s*\)\s+local\s+\w+\s*=\s*error\s+if[^e]+end\s+end\s+\1\s*\(\s*\)\s*/g,
-      () => { changed = true; return ' '; }
-    );
-
-    if (next !== result) result = next;
-  }
-
-  return collapseSpaces(result);
-}
-
-const OPAQUE_PREDICATES = [
-
-  /if\s+not\s*\(\s*\d+\s*==\s*\d+\s*\)\s*then\s+local\s+\w+\s*=\s*1\s+end\s*/g,
-
-  /if\s+type\s*\(\s*math\.pi\s*\)\s*==\s*"string"\s*then\s+local\s+_\s*=\s*1\s+end\s*/g,
-
-  /if\s+type\s*\(\s*nil\s*\)\s*==\s*"number"\s*then\s+while\s+true\s+do\s+local\s+\w+\s*=\s*1\s+end\s+end\s*/g,
-
-
-
-  /if\s+type\s*\(math\.pi\s*\)\s*==\s*"string"\s+then\s+local\s+_\s*=\s*\d+\s+end\s*/g,
-];
-
-function eliminateOpaquePredicates(code) {
-  let result = code;
-  for (const pat of OPAQUE_PREDICATES) {
-    pat.lastIndex = 0;
-    result = result.replace(pat, ' ');
-  }
-  return collapseSpaces(result);
-}
-
-const NOISE_PATTERNS = [
-
-  /do\s+local\s+(\w+)\s*=\s*\{\}\s+\1\s*\[\s*"_"\s*\]\s*=\s*1\s+\1\s*=\s*nil\s+end\s*/g,
-
-  /local\s+[IlvVIl]{2,}\d+\s*=\s*\d+\s+(?=local\s+[IlvVIl]{2,}\d+|if\s+|do\s+|for\s+|while\s+|end\b)/g,
-
-  /local\s+[IlvVIl]{2,}\d+\s*=\s*string\.char\s*\(\d+\)\s+/g,
-
-  /local\s+(?:KQ|HF|W8|SX|Rj|nT|pL|qZ|mV|xB|yC|wD)\d+\s*=\s*\d+\s+/g,
-];
-
-function stripNoiseCode(code) {
-  let result = code;
-  for (const pat of NOISE_PATTERNS) {
-    pat.lastIndex = 0;
-    result = result.replace(pat, ' ');
-  }
-  return collapseSpaces(result);
-}
-
-function linearizeCFF(code) {
-  let result = code;
-  let changed = true;
-  let passes  = 0;
-
-  while (changed && passes < 30) {
-    changed = false;
-    passes++;
-
-
-    result = result.replace(
-      /local\s+(\w+)\s*=\s*1\s+while\s+true\s+do\s+([\s\S]+?)\s+end\s+end/g,
-      (fullMatch, stateVar, body) => {
-
-        if (!body.includes(stateVar)) return fullMatch;
-
-        const stateBlocks = [];
-
-        const blockRx = new RegExp(
-          `(?:if|elseif)\\s+${stateVar}\\s*==\\s*(\\d+)\\s+then\\s+([\\s\\S]*?)\\s+${stateVar}\\s*=\\s*\\d+`,
-          'g'
-        );
-
-        let m;
-        while ((m = blockRx.exec(body)) !== null) {
-          const stateNum = parseInt(m[1], 10);
-          const content  = m[2].trim();
-          stateBlocks.push({ state: stateNum, content });
-        }
-
-        if (stateBlocks.length === 0) return fullMatch;
-
-        stateBlocks.sort((a, b) => a.state - b.state);
-        changed = true;
-        return stateBlocks.map(b => b.content).join(' ');
-      }
-    );
-  }
-
-  return result;
-}
-
-function extractRealHandlerBody(block) {
-
-  const handlerRx = /local\s+(\w+)\s*=\s*function\s*\(lM\)\s+local\s+lM\s*=\s*lM\s*;\s*([\s\S]+?)\s+end\s+(?=local\s+\w+\s*=\s*function|local\s+\w+\s*=\s*\{)/g;
-  const handlers  = [];
-  let m;
-
-  while ((m = handlerRx.exec(block)) !== null) {
-    const name = m[1];
-    const body = m[2].trim();
-
-    const isFake = /return\s+nil\s*$/.test(body);
-    handlers.push({ name, body, isFake });
-  }
-
-  const real = handlers.find(h => !h.isFake);
-  if (!real) return block;
-
-  return real.body;
-}
-
-function peelSingleVMLayer(code) {
-
-  if (!code.includes('local lM={}')) return null;
-
-  const inner = extractRealHandlerBody(code);
-  if (inner === code) return null;
-
-  return inner;
-}
-
-function unwrapVMLayers(code, ctx) {
-  ctx.depth = 0;
-  let current = code;
-
-  while (ctx.depth < MAX_UNWRAP_DEPTH) {
-    const inner = peelSingleVMLayer(current);
-    if (!inner || inner === current) break;
-    current = inner;
-    ctx.depth++;
-  }
-
-  return current;
-}
-
-function peelFragileVMLayer(code) {
-  if (!code.includes('VM corrupted')) return null;
-
-
-  const fragileRx = /local\s+(\w+)\s*=\s*function\s*\((\w+)\)\s+local\s+\w+\s*=\s*"[^"]*"\s+if\s+\2\s*\[\s*1\s*\]\s*~=\s*nil\s+then\s+error\s*\(\s*"VM corrupted"\s*\)\s+end\s+([\s\S]+?)\s+end\s+(?=local)/;
-  const m = code.match(fragileRx);
-  if (!m) return null;
-
-  const body = m[3].trim();
-
-  const cleaned = stripNoiseCode(eliminateOpaquePredicates(body));
-  return cleaned;
-}
-
-function unwrapFragileVMLayers(code, ctx) {
-  ctx.fragileDepth = 0;
-  let current = code;
-
-  while (ctx.fragileDepth < MAX_UNWRAP_DEPTH) {
-    const inner = peelFragileVMLayer(current);
-    if (!inner || inner === current) break;
-    current = inner;
-    ctx.fragileDepth++;
-  }
-
-  return current;
-}
-
-const IL_NAME_RX   = /\b([IlvV]{2,}\d+|[IlvV1][IlvV1]{1,}\d+)\b/g;
-
-const HAND_NAME_RX = /\b(KQ|HF|W8|SX|Rj|nT|pL|qZ|mV|xB|yC|wD)\d{1,2}\b/g;
-
-function normalizeObfuscatedNames(code) {
-  const renameMap = new Map();
-  let varCtr  = 1;
-  let hndCtr  = 1;
-
-  let m;
-  IL_NAME_RX.lastIndex = 0;
-  while ((m = IL_NAME_RX.exec(code)) !== null) {
-    if (!renameMap.has(m[0])) renameMap.set(m[0], `_v${varCtr++}`);
-  }
-
-  HAND_NAME_RX.lastIndex = 0;
-  while ((m = HAND_NAME_RX.exec(code)) !== null) {
-    if (!renameMap.has(m[0])) renameMap.set(m[0], `_h${hndCtr++}`);
-  }
-
-
-  const sorted = [...renameMap.entries()].sort((a, b) => b[0].length - a[0].length);
-  let result = code;
-  for (const [original, replacement] of sorted) {
-
-    const rx = new RegExp(`\\b${original.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'g');
-    result = result.replace(rx, replacement);
-  }
-
-  return { code: result, renameMap };
-}
-
-function isHttpUrl(s) {
-  if (!s) return false;
-  return /^https?:\/\/[^\s"']+/.test(s.trim());
-}
-
-function wrapHttpPayload(url) {
-  return `loadstring(game:HttpGet("${url.trim()}"))()`;
-}
-
-function formatLua(code) {
-  if (!code) return '';
-
-  let s = code.replace(/\s+/g, ' ').trim();
-
-  const newlineBefore = [
-    'local ', 'function ', 'if ', 'else', 'elseif ', 'end',
-    'for ', 'while ', 'do ', 'repeat', 'until ', 'return',
-    'break', '--'
-  ];
-
-  for (const kw of newlineBefore) {
-    const rx = new RegExp(`(?<![\\w])(?=${kw.replace(/ /g, '\\s*')})`, 'g');
-    s = s.replace(rx, '\n');
-  }
-
-  const lines  = s.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-  const result = [];
-  let depth    = 0;
-  const INDENT = '  ';
-
-  for (const line of lines) {
-
-    if (/^(end\b|else\b|until\b|elseif\b)/.test(line)) depth = Math.max(0, depth - 1);
-
-    result.push(INDENT.repeat(depth) + line);
-
-    if (/\b(do|then|repeat|function\s*\()/.test(line) && !/\bend\b/.test(line)) {
-      depth++;
-    }
-    if (/^else\b/.test(line)) depth++;
-    if (/^function\b/.test(line) && !/\bend\b/.test(line)) depth++;
-  }
-
-  return result.join('\n');
-}
-
-function analyzeObfuscatedCode(code) {
-  const hasFragileVM   = /error\s*\(\s*"VM corrupted"\s*\)/.test(code);
-  const hasTrueVM      = /local\s+_pool\s*=/.test(code) || /local\s+_order\s*=/.test(code);
-  const vmLayerCount   = (code.match(/local\s+lM\s*=\s*\{\}/g) || []).length;
-  const fragileCount   = (code.match(/VM corrupted/g) || []).length;
-  const hasHttpGet     = /HttpGet/i.test(code);
-  const hasLoadstring  = /loadstring/.test(code);
-  const hasAntiDebug   = /os\.clock/.test(code) && /150000/.test(code);
-  const hasIIFEGuards  = /local\s+\w+\s*=\s*function\s*\(\s*\)\s+local\s+\w+\s*=\s*error/.test(code);
-  const hasStringChar  = /string\.char\s*\(/.test(code);
-  const hasHeavyMath   = /\(\(\(\(\(/.test(code);
-  const hasCFF         = /while\s+true\s+do/.test(code) && /elseif\s+\w+\s*==/.test(code);
-  const inputSize      = Buffer.byteLength(code, 'utf8');
-
-  return {
-    mode:           hasFragileVM ? 'diabolical' : 'normal',
-    inputSizeBytes: inputSize,
-    vmLayerCount,
-    fragileVMLayers: fragileCount,
-    hasTrueVM,
-    hasHttpGet,
-    hasLoadstring,
-    hasAntiDebug,
-    hasIIFEGuards,
-    hasStringChar,
-    hasHeavyMath,
-    hasCFF,
-    estimatedComplexity: (
-      vmLayerCount > 10 || fragileCount > 5 ? 'HIGH' :
-      vmLayerCount > 3  || fragileCount > 0 ? 'MEDIUM' : 'LOW'
-    )
-  };
-}
-
-function collapseSpaces(s) {
-  return s.replace(/  +/g, ' ').trim();
-}
-
-function stripObfuscatorHeader(code) {
-  return code
-    .replace(/--\[\[\s*this code it's protected by v+mer obfoscator\s*\]\]\s*/gi, '')
-    .replace(/--\[\[\s*this code.*?obfoscator.*?\]\]\s*/gi, '')
-    .trim();
-}
-
-function looksLikeLua(s) {
-  if (!s || s.length < 5) return false;
-
-  return /\b(local|function|end|if|then|for|while|do|return|nil|true|false)\b/.test(s);
-}
-
-function deobfuscate(obfuscatedCode, opts = {}) {
-  const { format = true, verbose = false } = opts;
-  const startTime = Date.now();
-  const log       = [];
-  let recursionDepth = 0;
-
-  const info = (msg)  => { log.push(`[INFO]  ${msg}`); };
-  const warn = (msg)  => { log.push(`[WARN]  ${msg}`); };
-  const debug = (msg) => { if (verbose) log.push(`[DEBUG] ${msg}`); };
-
-  if (!obfuscatedCode || typeof obfuscatedCode !== 'string') {
-    return { success: false, error: 'Input must be a non-empty string.', log, stats: {} };
-  }
-  if (obfuscatedCode.trim().length === 0) {
-    return { success: false, error: 'Input is empty.', log, stats: {} };
-  }
-
-  info(`Input size: ${obfuscatedCode.length} chars / ${Buffer.byteLength(obfuscatedCode, 'utf8')} bytes`);
-
-  const analysis = analyzeObfuscatedCode(obfuscatedCode);
-  info(`Detected mode: ${analysis.mode}`);
-  info(`VM layers found: ${analysis.vmLayerCount}`);
-  info(`Fragile VM mentions: ${analysis.fragileVMLayers}`);
-  info(`Complexity: ${analysis.estimatedComplexity}`);
-  debug(`Full analysis: ${JSON.stringify(analysis)}`);
-
-  let code = obfuscatedCode;
-
-  code = stripObfuscatorHeader(code);
-  debug('Stripped obfuscator header comment.');
-
-  const beforeAD = code.length;
-  code = stripAntiDebug(code);
-  debug(`Anti-debug stripped: ${beforeAD - code.length} chars removed.`);
-
-  const beforeGuards = code.length;
-  code = stripIIFEGuards(code);
-  debug(`IIFE guards stripped: ${beforeGuards - code.length} chars removed.`);
-
-  const beforeMath = code.length;
-  code = simplifyMathExpressions(code);
-  code = simplifyMBAPatterns(code);
-  debug(`Math simplification: ${beforeMath - code.length} chars removed.`);
-
-  const beforeSC = code.length;
-  code = decodeStringChar(code);
-  debug(`string.char decoded: ${beforeSC - code.length} chars removed.`);
-
-  code = resolveGetfenvStrings(code);
-  debug('getfenv() identifiers resolved.');
-
-  code = eliminateOpaquePredicates(code);
-  code = stripNoiseCode(code);
-  debug('Opaque predicates and noise removed.');
-
-  const fragileCtx = { fragileDepth: 0 };
-  if (analysis.mode === 'diabolical') {
-    code = unwrapFragileVMLayers(code, fragileCtx);
-    info(`Peeled ${fragileCtx.fragileDepth} Fragile-VM layers.`);
-  }
-
-  const vmCtx = { depth: 0 };
-  code = unwrapVMLayers(code, vmCtx);
-  info(`Unwrapped ${vmCtx.depth} SingleVM dispatch layers.`);
-
-  code = linearizeCFF(code);
-  debug('CFF state machines linearised.');
-
-  code = simplifyMathExpressions(code);
-  code = decodeStringChar(code);
-  code = resolveGetfenvStrings(code);
-  code = collapseSpaces(code);
-  debug('Second-pass math/string simplification done.');
-
-  info('Attempting Rolling XOR-Affine cipher decryption...');
-  let decryptResult = decryptVMPayload(code);
-
-  if (!decryptResult.success) {
-    warn(`First decryption attempt failed: ${decryptResult.error}`);
-    warn('Applying deep simplification and retrying...');
-    let deepCode = code;
-    for (let i = 0; i < 3; i++) {
-      deepCode = simplifyMathExpressions(deepCode);
-      deepCode = decodeStringChar(deepCode);
-    }
-    decryptResult = decryptVMPayload(deepCode);
-  }
-
-  let finalCode;
-  let decryptionSuccess = false;
-
-  if (decryptResult.success) {
-    decryptionSuccess = true;
-    const payload = decryptResult.payload.trim();
-    info(`Payload decrypted: ${payload.length} chars (seed=${decryptResult.metadata.seed}, salt=${decryptResult.metadata.saltVal})`);
-    if (decryptResult.metadata.warnings && decryptResult.metadata.warnings.length > 0) {
-      for (const w of decryptResult.metadata.warnings) warn(w);
-    }
-
-    if (isHttpUrl(payload)) {
-      info('Payload is an HttpGet URL â€” reconstructing original call.');
-      finalCode = wrapHttpPayload(payload);
-    } else if (looksLikeLua(payload)) {
-
-      const innerAnalysis = analyzeObfuscatedCode(payload);
-      if (innerAnalysis.vmLayerCount > 0 || innerAnalysis.hasTrueVM) {
-        info('Payload is further obfuscated â€” recursing...');
-        recursionDepth++;
-        if (recursionDepth < 5) {
-          const inner = deobfuscate(payload, opts);
-          if (inner.success && inner.code) {
-            finalCode = inner.code;
-            for (const l of inner.log) log.push(`  [INNER] ${l}`);
-            info('Recursive deobfuscation succeeded.');
-          } else {
-            warn('Recursive deobfuscation failed; returning raw payload.');
-            finalCode = payload;
-          }
-          recursionDepth--;
-        } else {
-          warn('Max recursion depth reached; returning raw payload.');
-          finalCode = payload;
-        }
-      } else {
-        finalCode = payload;
-      }
-    } else {
-      warn('Decrypted payload does not look like Lua source; it may be encoded or binary.');
-      finalCode = payload;
-    }
-  } else {
-    warn(`Decryption failed: ${decryptResult.error}`);
-    warn('Returning best-effort structural reconstruction.');
-
-    finalCode = normalizeObfuscatedNames(code).code;
-  }
-
-  if (finalCode) {
-
-    if (!decryptionSuccess) {
-      finalCode = normalizeObfuscatedNames(finalCode).code;
-    }
-    if (format && looksLikeLua(finalCode)) {
-      finalCode = formatLua(finalCode);
-    }
-  }
-
-  const elapsed = Date.now() - startTime;
-  info(`Done in ${elapsed} ms. Output: ${(finalCode || '').length} chars.`);
-
-  const techniques = [];
-  if (analysis.hasHeavyMath)            techniques.push('Heavy math obfuscation');
-  if (analysis.hasStringChar)           techniques.push('string.char encoding');
-  if (analysis.hasTrueVM)               techniques.push('True VM with XOR-Affine cipher');
-  if (analysis.vmLayerCount > 0)        techniques.push(`${analysis.vmLayerCount} VM dispatch layers`);
-  if (analysis.fragileVMLayers > 0)     techniques.push(`${analysis.fragileVMLayers} Fragile-VM layers`);
-  if (analysis.hasCFF)                  techniques.push('Control Flow Flattening');
-  if (analysis.hasAntiDebug)            techniques.push('Anti-debug timing checks');
-  if (analysis.hasIIFEGuards)           techniques.push('IIFE integrity guards');
-  if (analysis.hasLoadstring)           techniques.push('loadstring payload');
-  if (analysis.hasHttpGet)              techniques.push('HttpGet network call');
-  if (techniques.length === 0)          techniques.push('Generic obfuscation');
-
-  const weakPoints = [];
-  if (analysis.hasHeavyMath)  weakPoints.push('Math expressions are deterministic â€” fully reversible');
-  if (analysis.hasStringChar) weakPoints.push('string.char args reduce to literals after math eval');
-  if (analysis.hasTrueVM)     weakPoints.push('XOR-Affine cipher uses static seed/salt â€” fully decryptable');
-  if (analysis.hasCFF)        weakPoints.push('CFF state machine has finite states â€” linearizable');
-  if (analysis.hasAntiDebug)  weakPoints.push('Anti-debug uses os.clock â€” strippable by pattern');
-  if (analysis.hasIIFEGuards) weakPoints.push('Integrity guards rely on error("!") â€” pattern matchable');
-  if (weakPoints.length === 0) weakPoints.push('Static analysis exposes the payload directly');
-
-  let status = 'good';
-  if (!decryptionSuccess) {
-    status = analysis.estimatedComplexity === 'HIGH' ? 'bad' : 'medium';
-  }
-
-  analysis.techniques = techniques;
-  analysis.weakPoints = weakPoints;
-  analysis.status     = status;
-
-  return {
-    success:    true,
-    code:       finalCode || '',
-    timeMs:     elapsed,
-    analysis,
-    log,
-    stats: {
-      inputSize:          obfuscatedCode.length,
-      outputSize:         (finalCode || '').length,
-      timeMs:             elapsed,
-      vmLayersUnwrapped:  vmCtx.depth,
-      fragileLayersUnwrapped: fragileCtx.fragileDepth,
-      decryptionSuccess,
-      payloadLength:      decryptResult.success ? decryptResult.metadata.payloadLength : 0
-    }
-  };
-}
-
-function printHelp() {
-  console.log(`
-â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—
-â•‘          CodeVault / vmmer Lua Deobfuscator  v${VERSION}                      â•‘
-â•‘          Supports: Normal (18x VM) and Diabolical (45x FragileVM)         â•‘
-â• â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•£
-â•‘  Usage:                                                                   â•‘
-â•‘    node deobfuscator.js <input.lua> [output.lua] [options]                â•‘
-â•‘    node deobfuscator.js --stdin [options]                                 â•‘
-â•‘    node deobfuscator.js --analyze <input.lua>                             â•‘
-â• â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•£
-â•‘  Options:                                                                 â•‘
-â•‘    -h, --help       Show this help                                        â•‘
-â•‘    -v, --verbose    Show detailed processing log                          â•‘
-â•‘    -a, --analyze    Analyse only (no decryption)                          â•‘
-â•‘    --stdin          Read input from stdin                                 â•‘
-â•‘    --no-format      Skip Lua beautifier                                   â•‘
-â•‘    --json           Output full result as JSON                            â•‘
-â• â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•£
-â•‘  20 Deobfuscation Techniques:                                             â•‘
-â•‘  01 heavyMath arithmetic evaluator    11 Opaque predicate eliminator      â•‘
-â•‘  02 MBA simplifier                    12 Tarpit dead-loop stripper        â•‘
-â•‘  03 string.char() decoder             13 Symbol waterfall remover         â•‘
-â•‘  04 getfenv() string resolver         14 CFF state-machine linearizer     â•‘
-â•‘  05 Rolling XOR-Affine decryptor      15 VM dispatch table analyzer       â•‘
-â•‘  06 Fake chunk pool decoy remover     16 Recursive VM layer unwrapper     â•‘
-â•‘  07 Chunk reassembler                 17 Fragile-VM layer peeler          â•‘
-â•‘  08 Anti-debug timing stripper        18 IL_POOL name normalizer          â•‘
-â•‘  09 debug.getinfo guard remover       19 HttpGet URL extractor            â•‘
-â•‘  10 IIFE integrity guard stripper     20 Lua code formatter               â•‘
-â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-  `);
-}
-
-function runCLI() {
-  const argv = process.argv.slice(2);
-
-  if (argv.length === 0 || argv.includes('--help') || argv.includes('-h')) {
-    printHelp();
-    process.exit(0);
-  }
-
-  const verbose    = argv.includes('--verbose')   || argv.includes('-v');
-  const analyzeOnly= argv.includes('--analyze')   || argv.includes('-a');
-  const fromStdin  = argv.includes('--stdin');
-  const asJson     = argv.includes('--json');
-  const noFormat   = argv.includes('--no-format');
-
-  const fileArgs   = argv.filter(a => !a.startsWith('-'));
-
-  let inputCode    = '';
-  let inputFile    = '';
-  let outputFile   = '';
-
-  if (fromStdin) {
-    try {
-      inputCode = fs.readFileSync('/dev/stdin', 'utf8');
-    } catch {
-      inputCode = fs.readFileSync(0, 'utf8');
-    }
-  } else {
-    if (fileArgs.length === 0) {
-      console.error('Error: No input file specified. Use --help for usage.');
-      process.exit(1);
-    }
-    inputFile  = fileArgs[0];
-    outputFile = fileArgs[1] || '';
-
-    if (!fs.existsSync(inputFile)) {
-      console.error(`Error: File not found: ${inputFile}`);
-      process.exit(1);
-    }
-    inputCode = fs.readFileSync(inputFile, 'utf8');
-  }
-
-  if (!inputCode.trim()) {
-    console.error('Error: Input is empty.');
+// ─── Entry Point ──────────────────────────────────────────────────────────────
+
+/**
+ * Process a single file or every .lua file inside a directory.
+ *
+ * @param {string} target  – file path or directory path
+ */
+async function main(target) {
+  if (!target) {
+    console.error("Usage: node deobfuscator.js <file.lua|directory>");
     process.exit(1);
   }
 
-  process.stderr.write(
-    `[*] CodeVault Deobfuscator v${VERSION}\n` +
-    `[*] Input: ${inputFile || 'stdin'} (${inputCode.length} chars)\n`
-  );
-
-  if (analyzeOnly) {
-    const analysis = analyzeObfuscatedCode(inputCode);
-    console.log(JSON.stringify(analysis, null, 2));
-    process.exit(0);
+  let stat;
+  try {
+    stat = fs.statSync(target);
+  } catch {
+    console.error(`Invalid path: ${target}`);
+    process.exit(1);
   }
 
-  const result = deobfuscate(inputCode, { format: !noFormat, verbose });
+  if (stat.isFile()) {
+    await deobfuscateFile(target);
+  } else if (stat.isDirectory()) {
+    const files = fs.readdirSync(target)
+      .filter((f) => f.endsWith(".lua") && !f.includes("temp_deob") && !f.includes(".report.txt") && !f.includes(".deobf."))
+      .sort();
 
-  if (verbose) {
-    for (const line of result.log) {
-      process.stderr.write(line + '\n');
+    if (files.length === 0) {
+      console.log("No .lua files found in directory.");
+      return;
     }
-  }
 
-  if (asJson) {
-    console.log(JSON.stringify(result, null, 2));
+    for (const file of files) {
+      await deobfuscateFile(path.join(target, file));
+      console.log("-".repeat(60));
+    }
   } else {
-    if (result.code) {
-      if (outputFile) {
-        fs.writeFileSync(outputFile, result.code, 'utf8');
-        process.stderr.write(
-          `[âœ“] Output â†’ ${outputFile} (${result.code.length} chars)\n` +
-          `[âœ“] VM layers unwrapped : ${result.stats.vmLayersUnwrapped}\n` +
-          `[âœ“] Fragile layers peeled: ${result.stats.fragileLayersUnwrapped}\n` +
-          `[âœ“] Decryption           : ${result.stats.decryptionSuccess ? 'SUCCESS âœ“' : 'PARTIAL âš '}\n` +
-          `[âœ“] Time                 : ${result.stats.timeMs} ms\n`
-        );
-      } else {
-        console.log(result.code);
-      }
-    } else {
-      process.stderr.write('[âœ—] Deobfuscation did not produce output.\n');
-      if (result.error) process.stderr.write(`    Error: ${result.error}\n`);
-      process.exit(1);
-    }
+    console.error("Target must be a file or directory.");
+    process.exit(1);
   }
 }
 
-module.exports = {
-
-  deobfuscate,
-
-  techniques: {
-    safeEvalMath,
-    simplifyMathExpressions,
-    simplifyMBAPatterns,
-    decodeStringChar,
-    resolveGetfenvStrings,
-    decryptVMPayload,
-    stripAntiDebug,
-    stripIIFEGuards,
-    eliminateOpaquePredicates,
-    stripNoiseCode,
-    linearizeCFF,
-    extractRealHandlerBody,
-    peelSingleVMLayer,
-    peelFragileVMLayer,
-    unwrapVMLayers,
-    unwrapFragileVMLayers,
-    normalizeObfuscatedNames,
-    isHttpUrl,
-    wrapHttpPayload,
-    formatLua,
-  },
-
-  utils: {
-    analyzeObfuscatedCode,
-    splitTopLevelCommas,
-    extractNumericArray,
-    looksLikeLua,
-    collapseSpaces,
-  }
-};
-
-if (require.main === module) {
-  runCLI();
-}
+// ─── Run ──────────────────────────────────────────────────────────────────────
+const target = process.argv[2] || "obfuscated_scripts";
+main(target).catch((err) => {
+  console.error("Fatal error:", err);
+  process.exit(1);
+});
