@@ -72,11 +72,3 @@ async function getInputFromMessage(message, args) {
     let cleaned = candidate;
     cleaned = cleaned.replace(/^
 http://googleusercontent.com/immersive_entry_chip/0
-
-### 🚨 IMPORTANTE antes de subirlo:
-1.  **Asegúrate** de haber creado el archivo `pastefy.js` que te pasé antes en la misma carpeta.
-2.  **Renombra** tu archivo `package json` a `package.json` (con el punto).
-3.  **Railway:** En el panel de Railway, ve a **Variables** y confirma que existe `DISCORD_TOKEN` con el valor de tu token.
-
-Con esto, el error de "Cannot find module" y el error de "ready" se solucionarán.
-  
