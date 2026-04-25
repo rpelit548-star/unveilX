@@ -776,13 +776,13 @@ function deobfuscate(obfuscatedCode, opts = {}) {
     }
 
     if (isHttpUrl(payload)) {
-      info('Payload is an HttpGet URL — reconstructing original call.');
+      info('Payload is an HttpGet URL â€” reconstructing original call.');
       finalCode = wrapHttpPayload(payload);
     } else if (looksLikeLua(payload)) {
 
       const innerAnalysis = analyzeObfuscatedCode(payload);
       if (innerAnalysis.vmLayerCount > 0 || innerAnalysis.hasTrueVM) {
-        info('Payload is further obfuscated — recursing...');
+        info('Payload is further obfuscated â€” recursing...');
         recursionDepth++;
         if (recursionDepth < 5) {
           const inner = deobfuscate(payload, opts);
@@ -826,9 +826,41 @@ function deobfuscate(obfuscatedCode, opts = {}) {
   const elapsed = Date.now() - startTime;
   info(`Done in ${elapsed} ms. Output: ${(finalCode || '').length} chars.`);
 
+  const techniques = [];
+  if (analysis.hasHeavyMath)            techniques.push('Heavy math obfuscation');
+  if (analysis.hasStringChar)           techniques.push('string.char encoding');
+  if (analysis.hasTrueVM)               techniques.push('True VM with XOR-Affine cipher');
+  if (analysis.vmLayerCount > 0)        techniques.push(`${analysis.vmLayerCount} VM dispatch layers`);
+  if (analysis.fragileVMLayers > 0)     techniques.push(`${analysis.fragileVMLayers} Fragile-VM layers`);
+  if (analysis.hasCFF)                  techniques.push('Control Flow Flattening');
+  if (analysis.hasAntiDebug)            techniques.push('Anti-debug timing checks');
+  if (analysis.hasIIFEGuards)           techniques.push('IIFE integrity guards');
+  if (analysis.hasLoadstring)           techniques.push('loadstring payload');
+  if (analysis.hasHttpGet)              techniques.push('HttpGet network call');
+  if (techniques.length === 0)          techniques.push('Generic obfuscation');
+
+  const weakPoints = [];
+  if (analysis.hasHeavyMath)  weakPoints.push('Math expressions are deterministic â€” fully reversible');
+  if (analysis.hasStringChar) weakPoints.push('string.char args reduce to literals after math eval');
+  if (analysis.hasTrueVM)     weakPoints.push('XOR-Affine cipher uses static seed/salt â€” fully decryptable');
+  if (analysis.hasCFF)        weakPoints.push('CFF state machine has finite states â€” linearizable');
+  if (analysis.hasAntiDebug)  weakPoints.push('Anti-debug uses os.clock â€” strippable by pattern');
+  if (analysis.hasIIFEGuards) weakPoints.push('Integrity guards rely on error("!") â€” pattern matchable');
+  if (weakPoints.length === 0) weakPoints.push('Static analysis exposes the payload directly');
+
+  let status = 'good';
+  if (!decryptionSuccess) {
+    status = analysis.estimatedComplexity === 'HIGH' ? 'bad' : 'medium';
+  }
+
+  analysis.techniques = techniques;
+  analysis.weakPoints = weakPoints;
+  analysis.status     = status;
+
   return {
     success:    true,
     code:       finalCode || '',
+    timeMs:     elapsed,
     analysis,
     log,
     stats: {
@@ -845,35 +877,35 @@ function deobfuscate(obfuscatedCode, opts = {}) {
 
 function printHelp() {
   console.log(`
-╔═══════════════════════════════════════════════════════════════════════════╗
-║          CodeVault / vmmer Lua Deobfuscator  v${VERSION}                      ║
-║          Supports: Normal (18x VM) and Diabolical (45x FragileVM)         ║
-╠═══════════════════════════════════════════════════════════════════════════╣
-║  Usage:                                                                   ║
-║    node deobfuscator.js <input.lua> [output.lua] [options]                ║
-║    node deobfuscator.js --stdin [options]                                 ║
-║    node deobfuscator.js --analyze <input.lua>                             ║
-╠═══════════════════════════════════════════════════════════════════════════╣
-║  Options:                                                                 ║
-║    -h, --help       Show this help                                        ║
-║    -v, --verbose    Show detailed processing log                          ║
-║    -a, --analyze    Analyse only (no decryption)                          ║
-║    --stdin          Read input from stdin                                 ║
-║    --no-format      Skip Lua beautifier                                   ║
-║    --json           Output full result as JSON                            ║
-╠═══════════════════════════════════════════════════════════════════════════╣
-║  20 Deobfuscation Techniques:                                             ║
-║  01 heavyMath arithmetic evaluator    11 Opaque predicate eliminator      ║
-║  02 MBA simplifier                    12 Tarpit dead-loop stripper        ║
-║  03 string.char() decoder             13 Symbol waterfall remover         ║
-║  04 getfenv() string resolver         14 CFF state-machine linearizer     ║
-║  05 Rolling XOR-Affine decryptor      15 VM dispatch table analyzer       ║
-║  06 Fake chunk pool decoy remover     16 Recursive VM layer unwrapper     ║
-║  07 Chunk reassembler                 17 Fragile-VM layer peeler          ║
-║  08 Anti-debug timing stripper        18 IL_POOL name normalizer          ║
-║  09 debug.getinfo guard remover       19 HttpGet URL extractor            ║
-║  10 IIFE integrity guard stripper     20 Lua code formatter               ║
-╚═══════════════════════════════════════════════════════════════════════════╝
+â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—
+â•‘          CodeVault / vmmer Lua Deobfuscator  v${VERSION}                      â•‘
+â•‘          Supports: Normal (18x VM) and Diabolical (45x FragileVM)         â•‘
+â• â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•£
+â•‘  Usage:                                                                   â•‘
+â•‘    node deobfuscator.js <input.lua> [output.lua] [options]                â•‘
+â•‘    node deobfuscator.js --stdin [options]                                 â•‘
+â•‘    node deobfuscator.js --analyze <input.lua>                             â•‘
+â• â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•£
+â•‘  Options:                                                                 â•‘
+â•‘    -h, --help       Show this help                                        â•‘
+â•‘    -v, --verbose    Show detailed processing log                          â•‘
+â•‘    -a, --analyze    Analyse only (no decryption)                          â•‘
+â•‘    --stdin          Read input from stdin                                 â•‘
+â•‘    --no-format      Skip Lua beautifier                                   â•‘
+â•‘    --json           Output full result as JSON                            â•‘
+â• â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•£
+â•‘  20 Deobfuscation Techniques:                                             â•‘
+â•‘  01 heavyMath arithmetic evaluator    11 Opaque predicate eliminator      â•‘
+â•‘  02 MBA simplifier                    12 Tarpit dead-loop stripper        â•‘
+â•‘  03 string.char() decoder             13 Symbol waterfall remover         â•‘
+â•‘  04 getfenv() string resolver         14 CFF state-machine linearizer     â•‘
+â•‘  05 Rolling XOR-Affine decryptor      15 VM dispatch table analyzer       â•‘
+â•‘  06 Fake chunk pool decoy remover     16 Recursive VM layer unwrapper     â•‘
+â•‘  07 Chunk reassembler                 17 Fragile-VM layer peeler          â•‘
+â•‘  08 Anti-debug timing stripper        18 IL_POOL name normalizer          â•‘
+â•‘  09 debug.getinfo guard remover       19 HttpGet URL extractor            â•‘
+â•‘  10 IIFE integrity guard stripper     20 Lua code formatter               â•‘
+â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
   `);
 }
 
@@ -949,17 +981,17 @@ function runCLI() {
       if (outputFile) {
         fs.writeFileSync(outputFile, result.code, 'utf8');
         process.stderr.write(
-          `[✓] Output → ${outputFile} (${result.code.length} chars)\n` +
-          `[✓] VM layers unwrapped : ${result.stats.vmLayersUnwrapped}\n` +
-          `[✓] Fragile layers peeled: ${result.stats.fragileLayersUnwrapped}\n` +
-          `[✓] Decryption           : ${result.stats.decryptionSuccess ? 'SUCCESS ✓' : 'PARTIAL ⚠'}\n` +
-          `[✓] Time                 : ${result.stats.timeMs} ms\n`
+          `[âœ“] Output â†’ ${outputFile} (${result.code.length} chars)\n` +
+          `[âœ“] VM layers unwrapped : ${result.stats.vmLayersUnwrapped}\n` +
+          `[âœ“] Fragile layers peeled: ${result.stats.fragileLayersUnwrapped}\n` +
+          `[âœ“] Decryption           : ${result.stats.decryptionSuccess ? 'SUCCESS âœ“' : 'PARTIAL âš '}\n` +
+          `[âœ“] Time                 : ${result.stats.timeMs} ms\n`
         );
       } else {
         console.log(result.code);
       }
     } else {
-      process.stderr.write('[✗] Deobfuscation did not produce output.\n');
+      process.stderr.write('[âœ—] Deobfuscation did not produce output.\n');
       if (result.error) process.stderr.write(`    Error: ${result.error}\n`);
       process.exit(1);
     }
