@@ -3,7 +3,7 @@
 const { request } = require('undici');
 
 /**
- * Sube contenido a Pastefy
+ * Sube contenido a Pastefy de forma anónima
  * @param {string} content - El código a subir
  * @param {string} title - Título del paste
  */
@@ -26,7 +26,6 @@ async function uploadToPastefy(content, title) {
     if (res.statusCode >= 200 && res.statusCode < 300 && data.success) {
       return {
         ok: true,
-        // Construimos la URL cruda (raw) y la normal
         url: `https://pastefy.app/${data.paste.id}`,
         rawUrl: `https://pastefy.app/${data.paste.id}/raw`
       };
@@ -39,4 +38,3 @@ async function uploadToPastefy(content, title) {
 }
 
 module.exports = { uploadToPastefy };
-            
