@@ -11,7 +11,8 @@ const {
   ButtonStyle
 } = require('discord.js');
 const { request } = require('undici');
-const { deobfuscate } = require('./deobfuscator');
+// Asegúrate de que estos archivos existan en la misma carpeta:
+const { deobfuscate } = require('./deobfuscator'); 
 const { uploadToPastefy } = require('./pastefy');
 
 const PREFIX = '.l';
@@ -69,138 +70,13 @@ async function getInputFromMessage(message, args) {
       return await fetchUrlContent(candidate);
     }
     let cleaned = candidate;
-    cleaned = cleaned.replace(/^```(?:lua|luau)?\s*\n?/i, '').replace(/\s*```$/, '');
-    return cleaned;
-  }
-  return null;
-}
+    cleaned = cleaned.replace(/^
+http://googleusercontent.com/immersive_entry_chip/0
 
-async function handleDeobfuscate(message, args) {
-  const startedAt = Date.now();
-  let typingTimer;
-  try {
-    if (typeof message.channel.sendTyping === 'function') {
-      await message.channel.sendTyping().catch(() => {});
-      typingTimer = setInterval(
-        () => message.channel.sendTyping().catch(() => {}),
-        8000
-      );
-    }
+### 🚨 IMPORTANTE antes de subirlo:
+1.  **Asegúrate** de haber creado el archivo `pastefy.js` que te pasé antes en la misma carpeta.
+2.  **Renombra** tu archivo `package json` a `package.json` (con el punto).
+3.  **Railway:** En el panel de Railway, ve a **Variables** y confirma que existe `DISCORD_TOKEN` con el valor de tu token.
 
-    const input = await getInputFromMessage(message, args);
-    if (!input || input.trim().length === 0) {
-      const errEmbed = new EmbedBuilder()
-        .setColor(RED)
-        .setTitle('Dump failed')
-        .setDescription('No input provided. Attach a file, paste code, or pass a URL after `.l`.');
-      await message.reply({ embeds: [errEmbed] });
-      return;
-    }
-
-    const result = deobfuscate(input, { format: true });
-
-    if (!result.success) {
-      const errEmbed = new EmbedBuilder()
-        .setColor(RED)
-        .setTitle('Dump failed')
-        .addFields(
-          { name: 'Error', value: '```' + (result.error || 'unknown').slice(0, 1000) + '```' },
-          { name: 'Time', value: formatTime(result.timeMs || (Date.now() - startedAt)), inline: true }
-        );
-      await message.reply({ embeds: [errEmbed] });
-      return;
-    }
-
-    const code = result.code || '';
-    const analysis = result.analysis || { techniques: [], weakPoints: [], status: 'bad' };
-
-    const fileBuffer = Buffer.from(code, 'utf8');
-    const attachment = new AttachmentBuilder(fileBuffer, { name: 'code.txt' });
-
-    const paste = await uploadToPastefy(code, `deobfuscated-${Date.now()}`);
-
-    const greenEmbed = new EmbedBuilder()
-      .setColor(GREEN)
-      .setTitle('Dump successfully')
-      .addFields(
-        {
-          name: 'Time',
-          value: formatTime(result.timeMs),
-          inline: true
-        },
-        {
-          name: 'Status',
-          value: STATUS_LABEL[analysis.status] || 'Unknown',
-          inline: true
-        },
-        {
-          name: 'Techniques',
-          value: (analysis.techniques.slice(0, 10).map(t => `• ${t}`).join('\n')) || 'None detected'
-        },
-        {
-          name: 'Weak point',
-          value: (analysis.weakPoints.slice(0, 6).map(w => `• ${w}`).join('\n')) || 'None'
-        }
-      );
-
-    const components = [];
-    if (paste.ok) {
-      const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setStyle(ButtonStyle.Link)
-          .setLabel('Open link')
-          .setURL(paste.rawUrl)
-      );
-      components.push(row);
-    } else {
-      greenEmbed.addFields({
-        name: 'Open link',
-        value: `Pastefy upload failed: ${paste.error || 'unknown'}`
-      });
-    }
-
-    const preview = firstNLines(code, 3);
-    const grayEmbed = new EmbedBuilder()
-      .setColor(GRAY)
-      .setDescription('```lua\n' + preview.slice(0, 3800) + '\n```');
-
-    await message.reply({
-      embeds: [greenEmbed, grayEmbed],
-      files: [attachment],
-      components
-    });
-  } catch (err) {
-    console.error('[ERROR]', err);
-    const errEmbed = new EmbedBuilder()
-      .setColor(RED)
-      .setTitle('Dump failed')
-      .setDescription('```' + (err.message || String(err)).slice(0, 1500) + '```');
-    await message.reply({ embeds: [errEmbed] }).catch(() => {});
-  } finally {
-    if (typingTimer) clearInterval(typingTimer);
-  }
-}
-
-client.once('clientReady', () => {
-  console.log(`[READY] Logged in as ${client.user.tag}`);
-  client.user.setActivity('.l <code|file|url>', { type: 0 });
-});
-
-client.on('messageCreate', async (message) => {
-  if (message.author.bot) return;
-  const content = message.content || '';
-  const trimmed = content.trimStart();
-  if (!trimmed.toLowerCase().startsWith(PREFIX)) return;
-  const after = trimmed.slice(PREFIX.length);
-  if (after.length > 0 && !/^\s/.test(after)) return;
-  const args = after.trim().length > 0 ? after.trim().split(/\s+/) : [];
-  await handleDeobfuscate(message, args);
-});
-
-client.on('error', (err) => console.error('[CLIENT ERROR]', err));
-process.on('unhandledRejection', (err) => console.error('[UNHANDLED]', err));
-
-client.login(TOKEN).catch((err) => {
-  console.error('[LOGIN FAILED]', err);
-  process.exit(1);
-});
+Con esto, el error de "Cannot find module" y el error de "ready" se solucionarán.
+  
